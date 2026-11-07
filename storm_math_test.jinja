@@ -1,8 +1,10 @@
 {# Paste into Developer Tools > Template to try the storm math with sample numbers.
    Values come from eventMotionDescription in the full alert, for example:
-   2026-11-05T19:29:00-00:00...storm...255DEG...26KT...3525 7810
+   2025-04-01T20:15:00-00:00...storm...240DEG...30KT...3450 9720
    (direction is where the storm is coming FROM, speed in knots) #}
-{% set slat = 35.25 %}  {% set slon = -78.10 %}
+{# sample storm: about 9 miles southwest of YOUR home zone #}
+{% set slat = state_attr('zone.home','latitude') - 0.09 %}
+{% set slon = state_attr('zone.home','longitude') - 0.10 %}
 {% set dirfrom = 255 %} {% set kt = 26 %}
 {% set t0 = as_timestamp(now()) - 300 %}   {# position time: here, 5 minutes ago #}
 
