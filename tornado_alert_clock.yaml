@@ -1,0 +1,18 @@
+alias: Tornado alert - Clock
+description: |-
+  Every minute WHILE a tornado warning is active (input_boolean.tornado_warning_active),
+  sends a tick to "Tornado alert" so it can check how close the storm is and repeat
+  the warning every 5 minutes. Does nothing the rest of the time.
+triggers:
+  - alias: Every minute
+    trigger: time_pattern
+    minutes: /1
+conditions:
+  - condition: state
+    entity_id: input_boolean.tornado_warning_active
+    state: "on"
+actions:
+  - event: tornado_tick
+    event_data:
+      minute: "{{ now().minute }}"
+mode: single

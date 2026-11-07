@@ -1,0 +1,56 @@
+alias: Tornado alert - Announcer
+description: |-
+  Says whatever "Tornado alert" sends it on EVERY speaker and tablet at the same
+  time (one step per device, so a dead one only misses its own). Day or night.
+  "Tornado alert" sends it an event: tornado_announce, with
+    message: what to say
+    times: 1, or 2 = say it, wait 20 seconds, say it again (take-shelter level)
+  Queued, so two announcements never talk over each other.
+
+  EDIT: one step per speaker below. Copy a step for each of yours.
+  Uses tts.cloud_say (Nabu Casa). With another TTS, swap the action
+  (for example tts.speak with your TTS entity).
+
+  TEST: Developer tools > Events > event type tornado_announce, data:
+    message: This is a test of the tornado announcer.
+    times: 1
+triggers:
+  - alias: Tornado alert asked for an announcement
+    trigger: event
+    event_type: tornado_announce
+actions:
+  - alias: Say it (1 or 2 times)
+    repeat:
+      count: "{{ trigger.event.data.times | default(1) | int(1) }}"
+      sequence:
+        - alias: Every speaker at the same time
+          parallel:
+          - alias: Kitchen
+            action: tts.cloud_say
+            continue_on_error: true
+            data:
+              cache: false
+              entity_id: media_player.kitchen_speaker
+              message: "{{ trigger.event.data.message }}"
+          - alias: Living room
+            action: tts.cloud_say
+            continue_on_error: true
+            data:
+              cache: false
+              entity_id: media_player.living_room_speaker
+              message: "{{ trigger.event.data.message }}"
+          - alias: Bedroom
+            action: tts.cloud_say
+            continue_on_error: true
+            data:
+              cache: false
+              entity_id: media_player.bedroom_speaker
+              message: "{{ trigger.event.data.message }}"
+        - alias: Pause before the second time
+          if:
+            - condition: template
+              value_template: "{{ repeat.index < (trigger.event.data.times | default(1) | int(1)) }}"
+          then:
+            - delay: "00:00:20"
+mode: queued
+max: 10

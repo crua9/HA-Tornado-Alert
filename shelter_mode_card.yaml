@@ -1,0 +1,25 @@
+# Shows only during a tornado warning. Needs Bubble Card (HACS).
+# Red = shelter mode off, green = on.
+type: conditional
+conditions:
+  - condition: state
+    entity: input_boolean.tornado_warning_active
+    state: "on"
+card:
+  type: custom:bubble-card
+  card_type: button
+  button_type: switch
+  entity: input_boolean.shelter_mode
+  name: Shelter mode - press when everyone is safe
+  icon: mdi:home-alert
+  show_state: true
+  show_last_changed: false
+  tap_action:
+    action: toggle
+  styles: |
+    .bubble-button-card-container {
+      background: ${state === 'on' ? 'rgba(46, 204, 113, 0.35)' : 'rgba(231, 76, 60, 0.45)'} !important;
+    }
+    .bubble-name { font-weight: 700; }
+grid_options:
+  columns: 12

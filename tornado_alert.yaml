@@ -1,0 +1,763 @@
+alias: Tornado alert
+description: |-
+  Tornado WARNINGS for the house (NWS Alerts sensor, set to the house GPS point).
+  Watches: email only. Every other alert type: ignored.
+  Announcements go through "Tornado alert - Announcer" (all speakers at once).
+
+  LEVEL 1 - TORNADO WARNING
+   - First message: "Tornado warning active" ON, push (rings through Do Not
+     Disturb), announcement: until when, radar indicated or CONFIRMED on the
+     ground, how far the storm is, which way, how many minutes.
+   - Repeats about every 5 minutes until the threat passes or SHELTER MODE is on.
+   - Shelter mode (tell the speaker: turn on shelter mode, or the dashboard
+     button): repeats stop, one "Shelter mode is on" announcement.
+     Turned on with no warning = turns itself back off. Resets at the all clear.
+   - Real changes are ALWAYS announced (even in shelter mode): new end time,
+     tornado confirmed, a second tornado warning, tornado emergency.
+     Every new message: push + email.
+
+  LEVEL 2 - TAKE SHELTER NOW (checked every minute)
+   - When: the storm is within 3 miles, OR heading at the house (path passes
+     within 3 miles) and 10 minutes or less away.
+   - Remembers which light automations were ON and pauses only those, saves the
+     lights, all lights 100% white, push, "Tornado danger. Get in the master
+     bedroom closet now..." said 2 times on every speaker. Plays in shelter mode.
+   - Steps back down when the storm is past: lights back how they were, the same automations back on, "The storm
+     has passed the house..." (moving away, passing more than 5 miles off, or
+     more than 10 miles away). The warning level keeps going.
+   - HA restarted during it: the automations still come back (saved in the
+     helper); the lights can't (Home Assistant forgets saved lights on restart),
+     so they stay on and you get a push.
+
+  ALL CLEAR
+   - Weather service says it will expire / cancelled: repeats stop, shelter mode
+     off, "threat has passed, officially ends at X" (or "is over"), push.
+   - Warning gone from the list: "it's done" push + email.
+
+  STORM POSITION: from the full weather service alert (rest_command
+  nws_alert_details in configuration.yaml): position, direction, speed. Between
+  updates the storm is moved forward on its track. If the lookup fails, it
+  still says radar indicated / confirmed from the warning text.
+
+  CLOCK: "Tornado alert - Clock" sends a tick every minute, only while
+  "Tornado warning active" is on.
+  CHANGE: repeat time = the "Every 5th minute" condition (5). Take-shelter distance and
+  minutes = the "imm" line in "storm" (3 miles / 10 minutes).
+
+  EMAIL: optional. Uses the SMTP integration. Set email_targets: [] for no email.
+
+  HELPERS:
+   - input_boolean.tornado_warning_active (Toggle "Tornado warning active")
+   - input_boolean.shelter_mode (Toggle "Shelter mode")
+   - input_boolean.tornado_take_shelter (Toggle "Tornado take shelter")
+   - input_text.tornado_paused_automations (Text "Tornado paused automations", max 255)
+   - input_text.tornado_storm_info (Text "Tornado storm info", max 255)
+triggers:
+  - alias: NWS alerts list changed - new tornado warning/watch message?
+    trigger: state
+    entity_id: sensor.nws_alerts_alerts
+    attribute: Alerts
+    id: new_msg
+  - alias: Warning toggle turned on - first announcement
+    trigger: state
+    entity_id: input_boolean.tornado_warning_active
+    from: "off"
+    to: "on"
+    id: warning_started
+  - alias: Clock tick (every minute, only during a warning) - storm check and 5-minute repeats
+    trigger: event
+    event_type: tornado_tick
+    id: tick
+  - alias: Shelter mode turned on
+    trigger: state
+    entity_id: input_boolean.shelter_mode
+    from: "off"
+    to: "on"
+    id: shelter_on
+  - alias: Tornado warning over for 1 minute (expiring, cancelled or gone) - all clear
+    trigger: template
+    value_template: >-
+      {%- set ns = namespace(on=false) -%}
+      {%- for x in state_attr('sensor.nws_alerts_alerts', 'Alerts') or [] if x.Event == 'Tornado Warning' -%}
+        {%- set h = (x.Headline or '') | upper -%}
+        {%- if x.Type != 'Cancel' and 'EXPIRE' not in h and 'CANCEL' not in h -%}{%- set ns.on = true -%}{%- endif -%}
+      {%- endfor -%}
+      {{ has_value('sensor.nws_alerts_alerts') and not ns.on }}
+    for:
+      minutes: 1
+    id: warning_over
+  - alias: NWS alerts changed - did the tornado warning just drop off the list (done)?
+    trigger: state
+    entity_id: sensor.nws_alerts_alerts
+    id: warning_gone
+  - alias: Email asked for (sent after the storm details are saved)
+    trigger: event
+    event_type: tornado_email
+    id: email
+  - alias: Home Assistant started - clean up if a take-shelter was left on
+    trigger: homeassistant
+    event: start
+    id: ha_start
+variables:
+  # ===== EDIT THESE =====
+  # Email notify entities (SMTP integration). Leave the list empty [] for no email.
+  email_targets:
+    - notify.YOUR_SMTP_NOTIFIER
+  # Where people should go when the storm is very close
+  safe_room: the safe room
+  # Every light to turn on 100% at TAKE SHELTER (saved first, put back after)
+  all_lights:
+    - light.living_room
+    - light.kitchen
+    - light.hallway
+    - light.stairs
+    - light.bedroom
+  # NAMES (as shown in the automation list) of light automations to pause during
+  # TAKE SHELTER. Only the ones that were ON get paused and turned back on.
+  pause_names:
+    - Kitchen lights motion
+    - Living room lights motion
+    - Stair lights motion
+  # ===== END EDIT =====
+  # Active (not ending) tornado warnings right now
+  warns: >-
+    {%- set ns = namespace(l=[]) -%}
+    {%- for x in state_attr('sensor.nws_alerts_alerts', 'Alerts') or [] if x.Event == 'Tornado Warning' -%}
+      {%- set h = (x.Headline or '') | upper -%}
+      {%- if x.Type != 'Cancel' and 'EXPIRE' not in h and 'CANCEL' not in h -%}{%- set ns.l = ns.l + [x] -%}{%- endif -%}
+    {%- endfor -%}
+    {{ ns.l }}
+  until_txt: >-
+    {%- set ts = warns | map(attribute='Expires') | select | map('as_timestamp') | list -%}
+    {{ (ts | max | timestamp_custom('%-I:%M %p')) if ts else 'further notice' }}
+  # Storm math from input_text.tornado_storm_info
+  # entry = key|time|dir from (deg)|mph|lat,lon;lat,lon|detection|damage threat|expires
+  storm: >-
+    {%- set raw = states('input_text.tornado_storm_info') -%}
+    {%- set hl = state_attr('zone.home', 'latitude') | float(0) -%}
+    {%- set ho = state_attr('zone.home', 'longitude') | float(0) -%}
+    {%- set cl = cos(hl * pi / 180) -%}
+    {%- set dirs = ['north', 'northeast', 'east', 'southeast', 'south', 'southwest', 'west', 'northwest'] -%}
+    {%- set ns = namespace(n=0, best=none, score=99999, observed=false, thr='') -%}
+    {%- for e in (raw.split('##') if raw not in ['', 'unknown', 'unavailable'] else []) -%}
+      {%- set p = e.split('|') -%}
+      {%- if p | length >= 8 -%}
+        {%- set ns.n = ns.n + 1 -%}
+        {%- if p[5] == 'OBSERVED' -%}{%- set ns.observed = true -%}{%- endif -%}
+        {%- if p[6] -%}{%- set ns.thr = p[6] -%}{%- endif -%}
+        {%- set mph = p[3] | float(0) -%}
+        {%- if p[1] | int(0) > 0 and ',' in p[4] -%}
+          {%- set hd = ((p[2] | float(0)) + 180) % 360 -%}
+          {%- set ux = sin(hd * pi / 180) -%}
+          {%- set uy = cos(hd * pi / 180) -%}
+          {%- set hrs = [[(now().timestamp() - (p[1] | int)) / 3600, 0] | max, 1.5] | min -%}
+          {%- set q = namespace(d=99999, x=0, y=0) -%}
+          {%- for pt in p[4].split(';') if ',' in pt -%}
+            {%- set sx = ((pt.split(',')[1] | float(0)) - ho) * 69.0 * cl + mph * hrs * ux -%}
+            {%- set sy = ((pt.split(',')[0] | float(0)) - hl) * 69.0 + mph * hrs * uy -%}
+            {%- set d = sqrt(sx * sx + sy * sy) -%}
+            {%- if d < q.d -%}{%- set q.d = d -%}{%- set q.x = sx -%}{%- set q.y = sy -%}{%- endif -%}
+          {%- endfor -%}
+          {%- set ahead = (0 - q.x) * ux + (0 - q.y) * uy -%}
+          {%- set cross = ((0 - q.x) * uy - (0 - q.y) * ux) | abs -%}
+          {%- set eta = (ahead / mph * 60) if mph > 0 and ahead > 0 else -1 -%}
+          {%- set cls = 'away' if ahead <= 0 else ('toward' if cross <= 3 else 'passing') -%}
+          {%- set imm = q.d <= 3 or (cls == 'toward' and eta >= 0 and eta <= 10) -%}
+          {%- set sc = (0 if imm else 1000) + (eta if cls == 'toward' else 500 + q.d) -%}
+          {%- if sc < ns.score -%}
+            {%- set ns.score = sc -%}
+            {%- set ns.best = {'dist': q.d | round(0) | int, 'cls': cls, 'eta': [eta | round(0) | int, 1] | max, 'cross': cross | round(0) | int,
+                               'cmp': dirs[((atan2(q.x, q.y) * 180 / pi + 360 + 22.5) % 360 // 45) | int],
+                               'move': dirs[((hd + 22.5) % 360 // 45) | int], 'mph': mph | round(0) | int, 'imm': imm,
+                               'observed': p[5] == 'OBSERVED'} -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set txt = (warns | map(attribute='Description') | map('default', '') | join(' ')) | upper -%}
+    {%- set from_text = 'CONFIRMED' in txt or 'OBSERVED TORNADO' in txt -%}
+    {{ {'n': [ns.n, warns | count] | max, 'best': ns.best, 'observed': ns.observed or from_text, 'thr': ns.thr} }}
+  det_txt: >-
+    {%- if storm.thr == 'CATASTROPHIC' -%}This is a tornado emergency. A large, dangerous tornado has been confirmed.
+    {%- elif storm.observed -%}A tornado has been confirmed on the ground.{{ ' This is a dangerous tornado.' if storm.thr == 'CONSIDERABLE' else '' }}
+    {%- else -%}Radar shows rotation. No tornado confirmed yet.
+    {%- endif -%}
+  storm_txt: >-
+    {%- set b = storm.best -%}
+    {%- if b is mapping -%}
+      {%- if b.dist <= 1 -%}The storm is right at the house.
+      {%- elif b.cls == 'toward' -%}The storm is {{ b.dist }} miles {{ b.cmp }}, heading toward the house, about {{ b.eta }} minutes away.
+      {%- elif b.cls == 'passing' -%}The storm is {{ b.dist }} miles {{ b.cmp }}, moving {{ b.move }}. Closest about {{ b.cross }} miles from the house.
+      {%- else -%}The storm is {{ b.dist }} miles {{ b.cmp }}, moving away from the house.
+      {%- endif -%}
+    {%- endif -%}
+  count_txt: "{{ ('There are ' ~ storm.n ~ ' tornado warnings for the house. ') if storm.n > 1 else '' }}"
+  main_msg: >-
+    Emergency. {{ count_txt }}Tornado warning for our area until {{ until_txt }}. {{ det_txt }} {{ storm_txt }}
+    Go to the lowest interior room of the house now. When everyone is safe, tell the speaker: turn on shelter mode.
+    Or press Shelter mode on the dashboard.
+  imm: "{{ storm.best is mapping and storm.best.imm }}"
+  passed: >-
+    {{ storm.best is mapping and not storm.best.imm and (storm.best.cls == 'away'
+       or (storm.best.cls == 'passing' and storm.best.cross > 5) or storm.best.dist > 10) }}
+  shelter_msg: >-
+    {%- set b = storm.best -%}
+    {%- set who = 'A confirmed tornado' if storm.observed else 'The storm' -%}
+    Tornado danger. Get in {{ safe_room }} now. Not in a minute. Now.
+    {% if b is mapping and b.cls == 'toward' and b.dist > 1 -%}
+    {{ who }} is {{ b.dist }} miles {{ b.cmp }} and coming at the house. About {{ b.eta }} minutes.
+    {%- elif b is mapping -%}
+    {{ who }} is {{ 'right at the house' if b.dist <= 1 else b.dist ~ ' miles ' ~ b.cmp ~ ', very close to the house' }}.
+    {%- endif %}
+actions:
+  - choose:
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: new_msg - new tornado warning/watch message(s): save storm details, change alerts, email"
+        conditions:
+          - condition: trigger
+            id: new_msg
+        sequence:
+          - variables:
+              new_msgs: >-
+                {%- set before = (trigger.from_state.attributes.Alerts | default([], true)) if trigger.from_state is not none else [] -%}
+                {%- set ids = before | map(attribute='ID') | list -%}
+                {{ (trigger.to_state.attributes.Alerts | default([], true))
+                   | selectattr('Event', 'in', ['Tornado Warning', 'Tornado Watch'])
+                   | rejectattr('ID', 'in', ids) | list }}
+          - repeat:
+              for_each: "{{ new_msgs }}"
+              sequence:
+                - variables:
+                    m: "{{ repeat.item }}"
+                    ending: "{{ m.Type == 'Cancel' or 'EXPIRE' in (m.Headline or '') | upper or 'CANCEL' in (m.Headline or '') | upper }}"
+                - if:
+                    - alias: It's a tornado WARNING (watches only get the email)
+                      condition: template
+                      value_template: "{{ m.Event == 'Tornado Warning' }}"
+                  then:
+                    - alias: Open the full alert from the weather service (storm position, speed, confirmed or not)
+                      action: rest_command.nws_alert_details
+                      continue_on_error: true
+                      data:
+                        url: "{{ m.URL }}"
+                      response_variable: r
+                    - variables:
+                        entry: >-
+                          {%- set c = r.content if r is defined and r is mapping and r.content is defined else '' -%}
+                          {%- set j = c if c is mapping else ((c | from_json(default={})) if c is string and c else {}) -%}
+                          {%- set prm = (j.get('properties') or {}).get('parameters') or {} -%}
+                          {%- set vt = (prm.get('VTEC') or [''])[0] -%}
+                          {%- set kk = vt | regex_findall('\.([A-Z]{4}\.TO\.W\.\d{4})\.') -%}
+                          {%- set key = kk[0] if kk else 'MSG' ~ (m.ID | string)[-6:] -%}
+                          {%- set mot = (prm.get('eventMotionDescription') or [''])[0] -%}
+                          {%- set mm = mot | regex_findall('^(\S+?)\.\.\.\w+\.\.\.(\d+)DEG\.\.\.(\d+)KT\.\.\.(.+)$') -%}
+                          {%- set desc = (m.Description or '') | upper -%}
+                          {%- set det = ((prm.get('tornadoDetection') or [''])[0] | upper) or ('OBSERVED' if 'CONFIRMED' in desc else 'RADAR INDICATED') -%}
+                          {%- set thr = (prm.get('tornadoDamageThreat') or [''])[0] | upper -%}
+                          {%- set exp = as_timestamp(m.Expires, 0) | int -%}
+                          {%- if mm -%}
+                            {%- set pts = (mm[0][3] | trim).split(' ')[:3] | join(';') -%}
+                            {{ key }}|{{ as_timestamp(mm[0][0], 0) | int }}|{{ mm[0][1] | int }}|{{ ((mm[0][2] | int) * 1.15078) | round(1) }}|{{ pts }}|{{ det }}|{{ thr }}|{{ exp }}
+                          {%- else -%}
+                            {{ key }}|0|0|0||{{ det }}|{{ thr }}|{{ exp }}
+                          {%- endif -%}
+                        old_list: >-
+                          {%- set raw = states('input_text.tornado_storm_info') -%}
+                          {{ raw.split('##') if raw not in ['', 'unknown', 'unavailable'] else [] }}
+                        key: "{{ entry.split('|')[0] }}"
+                        prev: >-
+                          {%- set ns = namespace(v='') -%}
+                          {%- for e in old_list if e.split('|')[0] == key -%}{%- set ns.v = e -%}{%- endfor -%}
+                          {{ ns.v }}
+                        others: >-
+                          {%- set ns = namespace(l=[]) -%}
+                          {%- for e in old_list if e.split('|')[0] != key -%}{%- set ns.l = ns.l + [e] -%}{%- endfor -%}
+                          {{ ns.l }}
+                    - alias: Save the storm details (or drop them if this warning is ending)
+                      action: input_text.set_value
+                      target:
+                        entity_id: input_text.tornado_storm_info
+                      data:
+                        value: "{{ ((others if ending else others + [entry]) | join('##'))[:255] }}"
+                    - if:
+                        - alias: Not an ending message
+                          condition: template
+                          value_template: "{{ not ending }}"
+                      then:
+                        - if:
+                            - alias: First warning (toggle still off)
+                              condition: state
+                              entity_id: input_boolean.tornado_warning_active
+                              state: "off"
+                          then:
+                            - alias: Turn the warning on (that run does the push + first announcement)
+                              action: input_boolean.turn_on
+                              target:
+                                entity_id: input_boolean.tornado_warning_active
+                          else:
+                            - variables:
+                                p_old: "{{ prev.split('|') if prev else [] }}"
+                                p_new: "{{ entry.split('|') }}"
+                                changes: >-
+                                  {%- set l = [] -%}
+                                  {%- if not prev and others | count > 0 -%}{%- set l = l + ['There is now a second tornado warning for the house.'] -%}{%- endif -%}
+                                  {%- if p_new[5] == 'OBSERVED' and (p_old | count < 8 or p_old[5] != 'OBSERVED') -%}{%- set l = l + ['A tornado has been confirmed on the ground.'] -%}{%- endif -%}
+                                  {%- if p_new[6] == 'CATASTROPHIC' and (p_old | count < 8 or p_old[6] != 'CATASTROPHIC') -%}{%- set l = l + ['This is now a tornado emergency.'] -%}{%- endif -%}
+                                  {%- if p_old | count >= 8 and (p_new[7] | int(0)) > 0 and (p_new[7] | int(0)) != (p_old[7] | int(0)) -%}{%- set l = l + ['It now lasts until ' ~ ((p_new[7] | int) | timestamp_custom('%-I:%M %p')) ~ '.'] -%}{%- endif -%}
+                                  {{ l | join(' ') }}
+                            - alias: Push - warning updated
+                              action: notify.mobile_app_YOUR_PHONE
+                              continue_on_error: true
+                              data:
+                                title: 🌪️ Tornado warning update
+                                message: "{{ changes if changes else 'Still in effect until ' ~ until_txt ~ '. Details in your email.' }}"
+                                data:
+                                  priority: high
+                                  tag: tornado_update
+                            - alias: Speakers only for REAL changes (plays even in shelter mode)
+                              if:
+                                - condition: template
+                                  value_template: "{{ changes != '' }}"
+                              then:
+                                - event: tornado_announce
+                                  event_data:
+                                    message: "Tornado warning update. {{ changes }} Stay in the lowest interior room."
+                                    times: 1
+                - alias: Detail email (after the details are saved, so it has the storm distance)
+                  event: tornado_email
+                  event_data:
+                    id: "{{ m.ID }}"
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: warning_started - first warning: push + first announcement"
+        conditions:
+          - condition: trigger
+            id: warning_started
+        sequence:
+          - action: notify.mobile_app_YOUR_PHONE
+            continue_on_error: true
+            data:
+              title: 🌪️ TORNADO WARNING
+              message: "Until {{ until_txt }}. {{ det_txt }} {{ storm_txt }} Go to the lowest interior room."
+              data:
+                ttl: 0
+                priority: high
+                channel: alarm_stream
+                tag: tornado_warning
+          - event: tornado_announce
+            event_data:
+              message: "{{ main_msg }}"
+              times: 1
+
+      # ------------------------------------------------------------------
+      # Note: the scene name is built with 'scene.' ~ ... on purpose, so Spook
+      # doesn't flag scene.before_tornado_state as missing (it only exists
+      # after scene.create runs).
+      - alias: "Triggered by: tick - storm very close / coming at the house: TAKE SHELTER NOW"
+        conditions:
+          - condition: trigger
+            id: tick
+          - condition: state
+            entity_id: input_boolean.tornado_warning_active
+            state: "on"
+          - condition: state
+            entity_id: input_boolean.tornado_take_shelter
+            state: "off"
+          - condition: template
+            value_template: "{{ imm }}"
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.tornado_take_shelter
+          - variables:
+              was_on: >-
+                {%- set ns = namespace(l=[]) -%}
+                {%- for n in pause_names -%}
+                  {%- set a = states.automation | selectattr('name', 'eq', n) | list -%}
+                  {%- if a and a[0].state == 'on' -%}{%- set ns.l = ns.l + [loop.index0 | string] -%}{%- endif -%}
+                {%- endfor -%}
+                {{ ns.l | join(',') }}
+          - alias: Remember which light automations were ON (survives a restart)
+            action: input_text.set_value
+            target:
+              entity_id: input_text.tornado_paused_automations
+            data:
+              value: "{{ was_on if was_on else 'none' }}"
+          - alias: Pause only those
+            action: automation.turn_off
+            continue_on_error: true
+            target:
+              entity_id: >-
+                {%- set ns = namespace(l=[]) -%}
+                {%- for i in (was_on.split(',') if was_on else []) -%}
+                  {%- set a = states.automation | selectattr('name', 'eq', pause_names[i | int]) | list -%}
+                  {%- if a -%}{%- set ns.l = ns.l + [a[0].entity_id] -%}{%- endif -%}
+                {%- endfor -%}
+                {{ ns.l }}
+            data:
+              stop_actions: true
+          - alias: Save the lights
+            action: scene.create
+            continue_on_error: true
+            data:
+              scene_id: before_tornado_state
+              snapshot_entities: "{{ all_lights }}"
+          - alias: All lights 100% white
+            action: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ all_lights }}"
+            data:
+              brightness_pct: 100
+              color_temp_kelvin: 4000
+          - alias: All lights 100% (for lights that can't do white)
+            action: light.turn_on
+            continue_on_error: true
+            target:
+              entity_id: "{{ all_lights }}"
+            data:
+              brightness_pct: 100
+          - action: notify.mobile_app_YOUR_PHONE
+            continue_on_error: true
+            data:
+              title: 🚨 TAKE SHELTER NOW
+              message: "{{ shelter_msg }}"
+              data:
+                ttl: 0
+                priority: high
+                channel: alarm_stream
+                tag: tornado_shelter
+          - event: tornado_announce
+            event_data:
+              message: "{{ shelter_msg }}"
+              times: 2
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: tick - storm has passed the house: lights and automations back, step down"
+        conditions:
+          - condition: trigger
+            id: tick
+          - condition: state
+            entity_id: input_boolean.tornado_take_shelter
+            state: "on"
+          - condition: template
+            value_template: "{{ passed }}"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.tornado_take_shelter
+          - alias: Lights back how they were
+            if:
+              - condition: template
+                value_template: "{{ states('scene.' ~ 'before_tornado_state') not in ['unknown', 'unavailable'] }}"
+            then:
+              - action: scene.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: "{{ 'scene.' ~ 'before_tornado_state' }}"
+            else:
+              - action: notify.mobile_app_YOUR_PHONE
+                continue_on_error: true
+                data:
+                  title: 💡 Lights couldn't be put back
+                  message: Home Assistant restarted during the tornado danger, so the saved lights were lost. They're still on.
+          - alias: The same light automations back on (only the ones that were on)
+            action: automation.turn_on
+            continue_on_error: true
+            target:
+              entity_id: >-
+                {%- set raw = states('input_text.tornado_paused_automations') -%}
+                {%- set ns = namespace(l=[]) -%}
+                {%- for i in (raw.split(',') if raw not in ['', 'none', 'unknown', 'unavailable'] else []) -%}
+                  {%- set a = states.automation | selectattr('name', 'eq', pause_names[i | int]) | list -%}
+                  {%- if a -%}{%- set ns.l = ns.l + [a[0].entity_id] -%}{%- endif -%}
+                {%- endfor -%}
+                {{ ns.l }}
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.tornado_paused_automations
+            data:
+              value: none
+          - event: tornado_announce
+            event_data:
+              message: >-
+                The storm has passed the house. The immediate danger is over. The tornado warning is still on until {{ until_txt }}. Stay inside.
+              times: 1
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: tick - every 5 minutes: repeat the warning (not in shelter mode or take shelter)"
+        conditions:
+          - condition: trigger
+            id: tick
+          - alias: Every 5th minute
+            condition: template
+            value_template: "{{ (trigger.event.data.minute | int(1)) % 5 == 0 }}"
+          - condition: state
+            entity_id: input_boolean.tornado_warning_active
+            state: "on"
+          - condition: state
+            entity_id: input_boolean.shelter_mode
+            state: "off"
+          - condition: state
+            entity_id: input_boolean.tornado_take_shelter
+            state: "off"
+          - alias: Not right after the first announcement (at least 3 minutes)
+            condition: template
+            value_template: "{{ (now() - states.input_boolean.tornado_warning_active.last_changed).total_seconds() > 180 }}"
+        sequence:
+          - event: tornado_announce
+            event_data:
+              message: "{{ main_msg }}"
+              times: 1
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: shelter_on - shelter mode on: confirm once (or undo it if there's no warning)"
+        conditions:
+          - condition: trigger
+            id: shelter_on
+        sequence:
+          - if:
+              - condition: state
+                entity_id: input_boolean.tornado_warning_active
+                state: "off"
+            then:
+              - alias: No warning - turned on by mistake, turn it back off
+                action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.shelter_mode
+            else:
+              - event: tornado_announce
+                event_data:
+                  message: Shelter mode is on. The tornado warning will not repeat. You will still hear any changes, and the all clear.
+                  times: 1
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: warning_over - threat passed / cancelled: everything back, all clear"
+        conditions:
+          - condition: trigger
+            id: warning_over
+          - condition: state
+            entity_id: input_boolean.tornado_warning_active
+            state: "on"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id:
+                - input_boolean.tornado_warning_active
+                - input_boolean.shelter_mode
+          - alias: If take-shelter was still on - lights and automations back
+            if:
+              - condition: state
+                entity_id: input_boolean.tornado_take_shelter
+                state: "on"
+            then:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.tornado_take_shelter
+              - if:
+                  - condition: template
+                    value_template: "{{ states('scene.' ~ 'before_tornado_state') not in ['unknown', 'unavailable'] }}"
+                then:
+                  - action: scene.turn_on
+                    continue_on_error: true
+                    target:
+                      entity_id: "{{ 'scene.' ~ 'before_tornado_state' }}"
+              - action: automation.turn_on
+                continue_on_error: true
+                target:
+                  entity_id: >-
+                    {%- set raw = states('input_text.tornado_paused_automations') -%}
+                    {%- set ns = namespace(l=[]) -%}
+                    {%- for i in (raw.split(',') if raw not in ['', 'none', 'unknown', 'unavailable'] else []) -%}
+                      {%- set a = states.automation | selectattr('name', 'eq', pause_names[i | int]) | list -%}
+                      {%- if a -%}{%- set ns.l = ns.l + [a[0].entity_id] -%}{%- endif -%}
+                    {%- endfor -%}
+                    {{ ns.l }}
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.tornado_paused_automations
+                data:
+                  value: none
+          - variables:
+              left: >-
+                {{ (state_attr('sensor.nws_alerts_alerts', 'Alerts') or []) | selectattr('Event', 'eq', 'Tornado Warning')
+                   | rejectattr('Type', 'eq', 'Cancel') | list }}
+              ends: "{{ (as_timestamp(left[0].Expires) | timestamp_custom('%-I:%M %p')) if left and left[0].Expires else '' }}"
+              clear_msg: >-
+                {{ ('The weather service says the tornado threat has passed. The warning officially ends at ' ~ ends ~ '. Shelter mode is now off.')
+                   if ends else 'The tornado warning is over. Shelter mode is now off.' }}
+          - action: notify.mobile_app_YOUR_PHONE
+            continue_on_error: true
+            data:
+              title: "{{ '🟡 Tornado threat has passed' if ends else '🟢 Tornado warning is over' }}"
+              message: "{{ clear_msg }}"
+              data:
+                tag: tornado_warning
+          - event: tornado_announce
+            event_data:
+              message: "{{ clear_msg }}"
+              times: 1
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: warning_gone - tornado warning dropped off the list: it's done (push + email)"
+        conditions:
+          - condition: trigger
+            id: warning_gone
+          - alias: There WAS a tornado warning a moment ago, and the new list (sensor working) has none
+            condition: template
+            value_template: >-
+              {%- set before = (trigger.from_state.attributes.Alerts | default([], true)) if trigger.from_state is not none else [] -%}
+              {{ trigger.to_state is not none and trigger.to_state.state not in ['unavailable', 'unknown']
+                 and before | selectattr('Event', 'eq', 'Tornado Warning') | list | count > 0
+                 and (trigger.to_state.attributes.Alerts | default([], true)) | selectattr('Event', 'eq', 'Tornado Warning') | list | count == 0 }}
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id:
+                - input_boolean.tornado_warning_active
+                - input_boolean.shelter_mode
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.tornado_storm_info
+            data:
+              value: ""
+          - action: notify.mobile_app_YOUR_PHONE
+            continue_on_error: true
+            data:
+              title: ✅ Tornado warning has ended
+              message: It's done. No tornado warning for the house anymore.
+              data:
+                tag: tornado_warning
+          - alias: Email - it's done (Run action alone works for testing)
+            if:
+              - condition: template
+                value_template: "{{ email_targets | count > 0 }}"
+            then:
+            - action: smtp.send_message
+            continue_on_error: true
+            target:
+              entity_id: "{{ email_targets }}"
+            data:
+              title: ✅ Tornado warning has ended - it's done
+              message: |-
+                ✅ DONE: the tornado warning for the house has ended. It's no longer on the weather service's list.
+
+                - 🕒 Ended: {{ now().strftime('%-I:%M %p') }}
+                - 🔗 Weather.gov for the house: https://forecast.weather.gov/MapClick.php?lat={{ state_attr('zone.home','latitude') }}&lon={{ state_attr('zone.home','longitude') }}
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: email - detail email for one warning/watch message"
+        conditions:
+          - condition: trigger
+            id: email
+        sequence:
+          - variables:
+              x: >-
+                {{ ((state_attr('sensor.nws_alerts_alerts', 'Alerts') or []) | selectattr('ID', 'eq', trigger.event.data.id) | list + [{}])[0] }}
+          - alias: Email - tornado details
+            if:
+              - condition: template
+                value_template: "{{ email_targets | count > 0 }}"
+            then:
+            - action: smtp.send_message
+            continue_on_error: true
+            target:
+              entity_id: "{{ email_targets }}"
+            data:
+              title: >-
+                {%- set h = (x.Headline or '') | upper -%}
+                {%- set until = (as_timestamp(x.Expires) | timestamp_custom('%-I:%M %p')) if x.Expires else 'further notice' -%}
+                {%- if not x -%}🌪️ Tornado alert (details no longer available)
+                {%- elif x.Type == 'Cancel' or 'CANCEL' in h -%}🟢 {{ x.Event }} CANCELLED
+                {%- elif 'EXPIRE' in h -%}🟡 {{ x.Event }} winding down - threat has passed, officially ends {{ until }}
+                {%- elif x.Event == 'Tornado Warning' -%}🔴 TORNADO WARNING until {{ until }}{{ ' - TORNADO CONFIRMED' if storm.observed else '' }} - take cover
+                {%- else -%}🟠 Tornado watch until {{ until }} - no action yet
+                {%- endif -%}
+              message: |-
+                {%- set h = (x.Headline or '') | upper -%}
+                {%- set ending = x.Type == 'Cancel' or 'EXPIRE' in h or 'CANCEL' in h -%}
+                {%- set until = (as_timestamp(x.Expires) | timestamp_custom('%-I:%M %p')) if x.Expires else 'further notice' -%}
+                {%- set desc = (x.Description or '') | regex_replace('(?<!\n)\n(?!\n)', ' ') | regex_replace(' +', ' ') -%}
+                {%- set where = desc | regex_findall('(?i)At \d{1,4} ?[AP]M [A-Z]{3},[^.]*?located ([^.]*)\.') -%}
+                {%- set first = desc | regex_findall('^\s*([^.]*\.)') -%}
+                {%- if not x -%}
+                The alert was no longer on the weather service's list when this email was made.
+                {%- else -%}
+                {%- if x.Type == 'Cancel' or 'CANCEL' in h -%}
+                🟢 CANCELLED: the {{ x.Event | lower }} for the house is over now.
+                {%- elif ending -%}
+                🟡 WINDING DOWN: the weather service says the threat has passed. The {{ x.Event | lower }} is still officially in effect until {{ until }}, then it ends (they won't renew it).
+                {%- elif x.Event == 'Tornado Warning' -%}
+                🔴 TORNADO WARNING FOR THE HOUSE until {{ until }}. Go to the lowest interior room.
+                {%- else -%}
+                🟠 Tornado watch until {{ until }}. Tornadoes are possible. No action yet.
+                {%- endif %}
+                {% if not ending and x.Event == 'Tornado Warning' %}
+                - 🔎 Tornado: {{ 'CONFIRMED on the ground' if storm.observed else 'radar indicated rotation (not confirmed)' }}{{ ' · TORNADO EMERGENCY' if storm.thr == 'CATASTROPHIC' else (' · dangerous tornado' if storm.thr == 'CONSIDERABLE' else '') }}
+                {%- if storm.best is mapping %}
+                - 📏 Storm from the house: {{ storm.best.dist }} miles {{ storm.best.cmp }}, moving {{ storm.best.move }} at {{ storm.best.mph }} mph
+                - 🧭 {{ 'Heading TOWARD the house, about ' ~ storm.best.eta ~ ' minutes away' if storm.best.cls == 'toward' else ('Passing by, closest about ' ~ storm.best.cross ~ ' miles' if storm.best.cls == 'passing' else 'Moving AWAY from the house') }}
+                {%- endif %}
+                {%- if storm.n > 1 %}
+                - ⚠️ Tornado warnings for the house right now: {{ storm.n }}
+                {%- endif %}
+                {%- endif %}
+                {%- if where %}
+                - 📍 Storm: {{ where[0] }}
+                {%- endif %}
+                {%- if ending and first %}
+                - 💬 Why: {{ first[0] | trim }}
+                {%- endif %}
+                - ⏰ Until: {{ until }}
+                - 🕒 Sent: {{ (as_timestamp(x.Sent) | timestamp_custom('%-I:%M %p')) if x.Sent else 'unknown' }} ({{ {'Alert': 'new', 'Update': 'update', 'Cancel': 'cancelled'}.get(x.Type, x.Type) }})
+                - 🔗 Weather.gov for the house: https://forecast.weather.gov/MapClick.php?lat={{ state_attr('zone.home','latitude') }}&lon={{ state_attr('zone.home','longitude') }}
+
+                ━━━━━━━━━━━━━━━━━━━━
+                Full text from the weather service ({{ x.AreasAffected or 'area unknown' }}):
+                {{ (x.Description or 'No details given.') | regex_replace('(?<!\n)\n(?!\n)', ' ') }}
+                {%- if x.Instruction %}
+
+                What they say to do: {{ x.Instruction | regex_replace('(?<!\n)\n(?!\n)', ' ') }}
+                {%- endif %}
+                {%- endif %}
+
+      # ------------------------------------------------------------------
+      - alias: "Triggered by: ha_start - take-shelter left on with no warning: put the automations back"
+        conditions:
+          - condition: trigger
+            id: ha_start
+          - condition: state
+            entity_id: input_boolean.tornado_take_shelter
+            state: "on"
+          - condition: state
+            entity_id: input_boolean.tornado_warning_active
+            state: "off"
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: input_boolean.tornado_take_shelter
+          - action: automation.turn_on
+            continue_on_error: true
+            target:
+              entity_id: >-
+                {%- set raw = states('input_text.tornado_paused_automations') -%}
+                {%- set ns = namespace(l=[]) -%}
+                {%- for i in (raw.split(',') if raw not in ['', 'none', 'unknown', 'unavailable'] else []) -%}
+                  {%- set a = states.automation | selectattr('name', 'eq', pause_names[i | int]) | list -%}
+                  {%- if a -%}{%- set ns.l = ns.l + [a[0].entity_id] -%}{%- endif -%}
+                {%- endfor -%}
+                {{ ns.l }}
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.tornado_paused_automations
+            data:
+              value: none
+          - action: notify.mobile_app_YOUR_PHONE
+            continue_on_error: true
+            data:
+              title: 💡 Tornado take-shelter cleaned up
+              message: Home Assistant restarted after the tornado danger. Light automations are back on; turn the lights down by hand if needed.
+trace:
+  stored_traces: 30
+mode: parallel
+max: 20

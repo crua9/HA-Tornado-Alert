@@ -1,0 +1,23 @@
+{# Paste into Developer Tools > Template to try the storm math with sample numbers.
+   Values come from eventMotionDescription in the full alert, for example:
+   2026-11-05T19:29:00-00:00...storm...255DEG...26KT...3525 7810
+   (direction is where the storm is coming FROM, speed in knots) #}
+{% set slat = 35.25 %}  {% set slon = -78.10 %}
+{% set dirfrom = 255 %} {% set kt = 26 %}
+{% set t0 = as_timestamp(now()) - 300 %}   {# position time: here, 5 minutes ago #}
+
+{% set lat0 = state_attr('zone.home','latitude') %}
+{% set lon0 = state_attr('zone.home','longitude') %}
+{% set mph = kt * 1.15078 %}
+{% set hdg = ((dirfrom + 180) % 360) * pi / 180 %}
+{% set mins = (now().timestamp() - t0) / 60 %}
+{% set e = (slon - lon0) * 69.0 * cos(lat0 * pi / 180) + sin(hdg) * mph * mins / 60 %}
+{% set n = (slat - lat0) * 69.0 + cos(hdg) * mph * mins / 60 %}
+{% set dist  = sqrt(e**2 + n**2) %}
+{% set ahead = -e * sin(hdg) - n * cos(hdg) %}
+{% set cross = (n * sin(hdg) - e * cos(hdg)) | abs %}
+{% set eta   = (ahead / mph * 60) if ahead > 0 else none %}
+{% set dirs = ['north','northeast','east','southeast','south','southwest','west','northwest'] %}
+{% set side = dirs[((atan2(e, n) * 180 / pi + 360 + 22.5) % 360 / 45) | int] %}
+{{ dist | round(1) }} mi {{ side }}, path passes within {{ cross | round(1) }} mi,
+{{ 'about ' ~ (eta | round(0) | int) ~ ' min away' if eta else 'moving away' }}

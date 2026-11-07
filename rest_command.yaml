@@ -1,0 +1,13 @@
+# Add this to configuration.yaml (merge it into your existing rest_command:
+# section if you already have one), then restart Home Assistant.
+# It opens the full alert from the weather service. The link is passed in
+# by the automation, so this one entry works for every warning.
+rest_command:
+  nws_alert_details:
+    url: "{{ url }}"
+    method: get
+    headers:
+      # The weather service asks for a User-Agent that identifies your app
+      User-Agent: "home-assistant tornado alert"
+      Accept: "application/geo+json"
+    timeout: 20
